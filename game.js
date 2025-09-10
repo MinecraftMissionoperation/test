@@ -17,11 +17,11 @@ let gameStarted = false;
 
 // --- ASSETS ---
 const survivorImg = new Image();
-survivorImg.src = "images/survivor.png";
+survivorImg.src = "images/Player-removebg-preview.png";
 const ghostImg = new Image();
-ghostImg.src = "images/ghost.png";
+ghostImg.src = "images/ghost-removebg-preview.png";
 const powerupImg = new Image();
-powerupImg.src = "images/powerup.png";
+powerupImg.src = "images/powerup-removebg-preview.png";
 
 // --- INPUT ---
 const input = {};
