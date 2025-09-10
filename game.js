@@ -25,7 +25,7 @@ const VIEW_H = canvas.height;
 // Camera and lighting tuning
 // ============================
 // Zoomed-in camera like Among Us: player appears larger; less map visible.
-const CAMERA_ZOOM = 2.0;      // 1.0 = no zoom; 2.0 is closer
+const CAMERA_ZOOM = 3.5;      // 1.0 = no zoom; 2.0 is closer
 const CAMERA_LERP = 0.22;     // 0 -> instant, 1 -> never moves (0.15-0.25 feels smooth)
 
 // Soft limited vision (vignette), not pitch-black
