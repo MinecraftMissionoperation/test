@@ -1,14 +1,4 @@
-// game.js — Halloween 2025: Mansion Escape
-// Complete, production-friendly client with:
-// - Home screen: Singleplayer and Multiplayer (WebSocket) modes
-// - Dynamic map loading (image + JSON walls/obstacles/doors)
-// - Player, Ghost AI, Powerups
-// - Camera, collisions, HUD, pause/debug toggles
-// - Footsteps, ghost chase, caught, powerup sounds
-// - Fog of war + flashlight cone
-// - Multiplayer client with simple room join and player sync
-// - Graceful fallbacks if assets are missing
-// - Clean structure and clear comments
+// game.js — Halloween 2025: Mansion Escape (Among Us-style camera and lighter lighting)
 
 // ============================
 // Canvas and context
@@ -21,11 +11,24 @@ const VIEW_W = canvas.width;
 const VIEW_H = canvas.height;
 
 // ============================
+// Camera and lighting tuning
+// ============================
+// Zoom in so you see a smaller portion of the map (Among Us vibe)
+const CAMERA_ZOOM = 1.6;          // 1.0 = no zoom; 1.6 shows a smaller area (more zoomed-in)
+const CAMERA_LERP = 0.2;          // camera smoothing (0 = instant, 1 = no movement)
+
+// Softer lighting: not pitch-black
+const FOG_ENABLED = true;         // set to false to disable vignette
+const AMBIENT_DARKNESS = 0.35;    // how dark the edges are (0.0–0.8 is reasonable)
+const LIGHT_RADIUS = 260;         // soft visibility radius in pixels (pre-zoom)
+const CONE_ENABLED = false;       // optional directional cone; off for clearer view
+
+// ============================
 // Game/world config
 // ============================
-let MAP_WIDTH = 1920;     // Updated to map image dimensions on load
+let MAP_WIDTH = 1920;     // Updated to map image size on load
 let MAP_HEIGHT = 1080;
-let currentMapName = "mansion"; // expects: maps/mansion.jpeg + maps/mansion.json
+let currentMapName = "mansion"; // expects maps/mansion.jpeg + maps/mansion.json
 
 // Tuning
 const DETECTION_RADIUS = 150;
@@ -48,7 +51,7 @@ let mapImageLoaded = false;
 
 let walls = [];      // colliding rectangles
 let obstacles = [];  // optional extra colliders (furniture)
-let doorways = [];   // non-colliding zones (for future expansion)
+let doorways = [];   // non-colliding zones (not used for collision)
 
 // ============================
 // Sounds
@@ -58,7 +61,6 @@ const ghostChaseSound = new Audio("sounds/ghost_chase.mp3");
 const caughtSound = new Audio("sounds/caught.mp3");
 const powerupSound = new Audio("sounds/powerup.mp3");
 
-// Volume and simple spam control
 footstepSound.volume = 0.35;
 ghostChaseSound.volume = 0.7;
 caughtSound.volume = 0.8;
@@ -70,10 +72,7 @@ function playSound(snd, key = null, cooldownMs = 120) {
   const k = key || snd;
   const last = soundCooldowns.get(k) || 0;
   if (now - last < cooldownMs) return;
-  try {
-    snd.currentTime = 0;
-    snd.play();
-  } catch (_) {}
+  try { snd.currentTime = 0; snd.play(); } catch (_) {}
   soundCooldowns.set(k, now);
 }
 
@@ -126,7 +125,7 @@ function aabbEntityHit(A, B) {
   return aabbRectHit(A.x, A.y, A.size, A.size, B.x, B.y, B.size, B.size);
 }
 
-// Attempt to move only on one axis at a time for clean corner collision
+// Move only one axis at a time to reduce corner snagging
 function moveAxis(x, y, size, dx, dy) {
   let nx = x + dx;
   let ny = y + dy;
@@ -137,7 +136,6 @@ function moveAxis(x, y, size, dx, dy) {
       if (dx < 0) nx = w.x + w.w;
       if (dy > 0) ny = w.y - size;
       if (dy < 0) ny = w.y + w.h;
-      // Cancel movement on that axis
       return dx !== 0 ? x : y;
     }
   }
@@ -189,7 +187,6 @@ class Player {
 
     if (dx !== 0 || dy !== 0) {
       playSound(footstepSound, "footsteps", 200);
-      // multiplayer position sync
       if (multiplayer && socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "move", x: this.x, y: this.y, sprinting: this.sprinting }));
       }
@@ -197,14 +194,13 @@ class Player {
   }
 
   draw(cameraX, cameraY) {
-    // Prefer sprite; otherwise colored square
+    // Prefer sprite; fallback square
     if (survivorImg.complete && survivorImg.naturalHeight > 0) {
       ctx.drawImage(survivorImg, this.x - cameraX, this.y - cameraY, this.size, this.size);
     } else {
       ctx.fillStyle = this.color;
       ctx.fillRect(this.x - cameraX, this.y - cameraY, this.size, this.size);
     }
-
     // Name tag
     ctx.fillStyle = "white";
     ctx.font = "12px Arial";
@@ -342,18 +338,16 @@ function startSpeedBuff(durationMs, multiplier) { speedBuffTime = durationMs; sp
 function getWalkSpeed() { return WALK_SPEED * (speedBuffTime > 0 ? speedBuffMultiplier : 1); }
 function getSprintSpeed() { return SPRINT_SPEED * (speedBuffTime > 0 ? speedBuffMultiplier : 1); }
 
-// Monkey-patch Player.update to use buff speeds without rewriting logic everywhere
+// Patch Player.update to use buffed speeds without rewriting logic everywhere
 (function patchPlayerForSpeedBuff(){
   const origUpdate = Player.prototype.update;
   Player.prototype.update = function() {
-    const wasSprinting = this.sprinting;
+    const prevSprint = this.sprinting;
     const prevSpeed = this.speed;
 
-    // compute with buffed speeds
     this.sprinting = !!input["shift"];
     this.speed = this.sprinting ? getSprintSpeed() : getWalkSpeed();
 
-    // Run movement using local copy (adapted from original)
     let dx = 0, dy = 0;
     if (input["w"] || input["arrowup"]) dy -= this.speed;
     if (input["s"] || input["arrowdown"]) dy += this.speed;
@@ -375,57 +369,73 @@ function getSprintSpeed() { return SPRINT_SPEED * (speedBuffTime > 0 ? speedBuff
       }
     }
 
-    // restore (not strictly necessary, but keeps state clean)
-    this.sprinting = wasSprinting;
+    this.sprinting = prevSprint;
     this.speed = prevSpeed;
   };
 })();
 
 // ============================
-// Camera + Fog of War
+// Camera (with smoothing) + Fog/Vignette
 // ============================
-function getCamera() {
-  let cameraX = player.x - VIEW_W / 2;
-  let cameraY = player.y - VIEW_H / 2;
-  cameraX = clamp(cameraX, 0, Math.max(0, MAP_WIDTH - VIEW_W));
-  cameraY = clamp(cameraY, 0, Math.max(0, MAP_HEIGHT - VIEW_H));
-  return { cameraX, cameraY };
+let camX = 0;
+let camY = 0;
+
+function getTargetCamera() {
+  // Use virtual view size (pre-zoom) to compute camera bounds
+  const viewW = VIEW_W / CAMERA_ZOOM;
+  const viewH = VIEW_H / CAMERA_ZOOM;
+
+  let targetX = player.x - viewW / 2;
+  let targetY = player.y - viewH / 2;
+
+  targetX = clamp(targetX, 0, Math.max(0, MAP_WIDTH - viewW));
+  targetY = clamp(targetY, 0, Math.max(0, MAP_HEIGHT - viewH));
+  return { targetX, targetY, viewW, viewH };
 }
 
-function drawFog(cameraX, cameraY) {
-  // Fog with flashlight cone around player
-  const px = player.x - cameraX + player.size / 2;
-  const py = player.y - cameraY + player.size / 2;
+function updateCamera() {
+  const { targetX, targetY } = getTargetCamera();
+  camX += (targetX - camX) * CAMERA_LERP;
+  camY += (targetY - camY) * CAMERA_LERP;
+}
+
+function drawVignette() {
+  if (!FOG_ENABLED) return;
+
+  // Player screen position (post-zoom)
+  const px = (player.x - camX + player.size / 2) * CAMERA_ZOOM;
+  const py = (player.y - camY + player.size / 2) * CAMERA_ZOOM;
 
   ctx.save();
-  ctx.fillStyle = "rgba(0,0,0,0.85)";
+  // Soft vignette: darkens edges, leaves center lighter
+  const grd = ctx.createRadialGradient(px, py, 10, px, py, LIGHT_RADIUS * CAMERA_ZOOM);
+  grd.addColorStop(0, "rgba(0,0,0,0.0)");
+  grd.addColorStop(1, `rgba(0,0,0,${AMBIENT_DARKNESS})`);
+
+  ctx.fillStyle = grd;
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
-  // flashlight cone
-  const angle = Math.atan2((input["s"]?1:0) - (input["w"]?1:0), (input["d"]?1:0) - (input["a"]?1:0));
-  const facing = isFinite(angle) ? angle : 0;
+  if (CONE_ENABLED) {
+    // Optional directional cone (kept subtle)
+    const dirX = (input["d"]?1:0) - (input["a"]?1:0);
+    const dirY = (input["s"]?1:0) - (input["w"]?1:0);
+    const angle = Math.atan2(dirY, dirX);
+    const facing = Number.isFinite(angle) ? angle : 0;
 
-  const grad = ctx.createRadialGradient(px, py, 20, px, py, 220);
-  grad.addColorStop(0, "rgba(0,0,0,0.0)");
-  grad.addColorStop(1, "rgba(0,0,0,1.0)");
+    ctx.translate(px, py);
+    ctx.rotate(facing);
+    const cone = ctx.createLinearGradient(0, 0, 320 * CAMERA_ZOOM, 0);
+    cone.addColorStop(0, "rgba(0,0,0,0.0)");
+    cone.addColorStop(1, `rgba(0,0,0,${AMBIENT_DARKNESS})`);
+    ctx.fillStyle = cone;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(320 * CAMERA_ZOOM, -120 * CAMERA_ZOOM);
+    ctx.lineTo(320 * CAMERA_ZOOM, 120 * CAMERA_ZOOM);
+    ctx.closePath();
+    ctx.fill();
+  }
 
-  // Cut circular field
-  ctx.globalCompositeOperation = "destination-out";
-  ctx.beginPath();
-  ctx.arc(px, py, 160, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Add directional cone
-  ctx.globalCompositeOperation = "destination-out";
-  ctx.translate(px, py);
-  ctx.rotate(facing);
-  ctx.beginPath();
-  ctx.moveTo(0, 0);
-  ctx.lineTo(300, -100);
-  ctx.lineTo(300, 100);
-  ctx.closePath();
-  ctx.fillStyle = "rgba(0,0,0,1.0)";
-  ctx.fill();
   ctx.restore();
 }
 
@@ -434,13 +444,11 @@ function drawFog(cameraX, cameraY) {
 // ============================
 let lastTime = performance.now();
 function update(dt) {
-  // Buff timer
   if (speedBuffTime > 0) speedBuffTime -= dt;
 
   player.update();
   for (const g of ghosts) g.update(player);
 
-  // Player-ghost collision
   for (const g of ghosts) {
     if (aabbEntityHit(g, player)) {
       playSound(caughtSound, "caught", 400);
@@ -450,59 +458,61 @@ function update(dt) {
     }
   }
 
-  // Powerups
   for (const pu of powerups) {
     if (pu.active && aabbRectHit(player.x, player.y, player.size, pu.x, pu.y, pu.size, pu.size)) {
       pu.active = false;
       playSound(powerupSound, "powerup", 300);
       pu.apply(player);
-      // Sync to others
       if (multiplayer && socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "powerupTaken", x: pu.x, y: pu.y }));
       }
     }
   }
+
+  updateCamera();
 }
 
 function draw() {
-  const { cameraX, cameraY } = getCamera();
+  // WORLD SPACE (scaled)
+  ctx.save();
+  ctx.scale(CAMERA_ZOOM, CAMERA_ZOOM);
+
+  const viewW = VIEW_W / CAMERA_ZOOM;
+  const viewH = VIEW_H / CAMERA_ZOOM;
+
+  ctx.clearRect(0, 0, viewW, viewH);
 
   // Map background
-  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
   if (mapImageLoaded) {
-    ctx.drawImage(mapImage, -cameraX, -cameraY, MAP_WIDTH, MAP_HEIGHT);
+    ctx.drawImage(mapImage, -camX, -camY, MAP_WIDTH, MAP_HEIGHT);
   } else {
     ctx.fillStyle = "#111";
-    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.fillRect(0, 0, viewW, viewH);
     ctx.fillStyle = "#333";
-    ctx.fillRect(16, 16, VIEW_W - 32, VIEW_H - 32);
+    ctx.fillRect(16 - camX, 16 - camY, viewW - 32, viewH - 32);
   }
 
   // Debug colliders
-  for (const w of walls) w.draw(cameraX, cameraY);
-  for (const o of obstacles) o.draw(cameraX, cameraY);
-  for (const d of doorways) d.draw(cameraX, cameraY);
+  for (const w of walls) w.draw(camX, camY);
+  for (const o of obstacles) o.draw(camX, camY);
+  for (const d of doorways) d.draw(camX, camY);
 
   // Powerups
-  for (const pu of powerups) pu.draw(cameraX, cameraY);
+  for (const pu of powerups) pu.draw(camX, camY);
 
   // Ghosts
-  for (const g of ghosts) g.draw(cameraX, cameraY);
+  for (const g of ghosts) g.draw(camX, camY);
 
-  // Other players (multiplayer)
-  Object.values(otherPlayers).forEach(op => {
-    ctx.save();
-    ctx.globalAlpha = 0.9;
-    op.draw(cameraX, cameraY);
-    ctx.restore();
-  });
+  // Other players
+  Object.values(otherPlayers).forEach(op => op.draw(camX, camY));
 
-  // Local player on top
-  player.draw(cameraX, cameraY);
+  // Local player
+  player.draw(camX, camY);
 
-  // Fog of war last
-  drawFog(cameraX, cameraY);
+  ctx.restore();
 
+  // SCREEN SPACE (post-scale) — Vignette/HUD
+  drawVignette();
   drawHUD();
 }
 
@@ -512,9 +522,7 @@ function drawHUD() {
   ctx.textBaseline = "top";
   ctx.fillText(`Lives: ${player.lives}`, 20, 20);
 
-  if (multiplayer) {
-    ctx.fillText(`Online: ${1 + Object.keys(otherPlayers).length}`, 20, 44);
-  }
+  if (multiplayer) ctx.fillText(`Online: ${1 + Object.keys(otherPlayers).length}`, 20, 44);
 
   if (paused) {
     ctx.fillStyle = "rgba(0,0,0,0.5)";
@@ -534,6 +542,7 @@ function drawHUD() {
     ctx.fillText(`DEBUG | Map: ${currentMapName} ${MAP_WIDTH}x${MAP_HEIGHT}`, 20, 68);
     ctx.fillText(`Player: (${Math.round(player.x)}, ${Math.round(player.y)})`, 20, 86);
     ctx.fillText(`Walls: ${walls.length} Obst: ${obstacles.length}`, 20, 104);
+    ctx.fillText(`Zoom: ${CAMERA_ZOOM.toFixed(2)}`, 20, 122);
   }
 }
 
@@ -566,8 +575,9 @@ async function loadMap(mapName) {
   // Load image
   await new Promise((resolve) => {
     mapImage.onload = () => {
-      MAP_WIDTH = mapImage.width || MAP_WIDTH;
-      MAP_HEIGHT = mapImage.height || MAP_HEIGHT;
+      // Ensure image is bigger than view to see scrolling
+      MAP_WIDTH = mapImage.width || Math.max(MAP_WIDTH, VIEW_W * 1.5);
+      MAP_HEIGHT = mapImage.height || Math.max(MAP_HEIGHT, VIEW_H * 1.5);
       mapImageLoaded = true;
       resolve();
     };
@@ -587,6 +597,11 @@ async function loadMap(mapName) {
   }
 
   placePlayerAtSafeSpawn();
+
+  // Snap camera to player immediately on load
+  const { targetX, targetY } = getTargetCamera();
+  camX = targetX;
+  camY = targetY;
 }
 
 // ============================
@@ -643,7 +658,6 @@ function startGame(mode) {
   }
 }
 
-// Bind buttons after DOM is ready
 window.addEventListener("DOMContentLoaded", () => {
   const singleBtn = document.getElementById("singleplayerBtn");
   const multiBtn = document.getElementById("multiplayerBtn");
@@ -652,28 +666,12 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 // ============================
-// Multiplayer client
+// Multiplayer client (simple WebSocket protocol)
 // ============================
-// Protocol (simple):
-// - Client -> Server:
-//   { type: "hello", name: "PlayerXYZ" }
-//   { type: "move", x, y, sprinting }
-//   { type: "powerupTaken", x, y }
-//   { type: "ping" }
-// - Server -> Client:
-//   { type: "welcome", id, players: [{id,x,y}], map: "mansion" }
-//   { type: "playerJoined", id, x, y }
-//   { type: "playerMoved", id, x, y, sprinting }
-//   { type: "playerLeft", id }
-//   { type: "powerupTaken", x, y }
-//   { type: "pong" }
-
 let reconnectTimer = null;
 
 async function initMultiplayer() {
   await connectSocket();
-
-  // Periodic ping to keep connection alive
   setInterval(() => {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "ping", t: Date.now() }));
@@ -684,23 +682,18 @@ async function initMultiplayer() {
 function connectSocket() {
   return new Promise((resolve) => {
     try {
-      socket = new WebSocket("ws://localhost:8080"); // replace with your server URL
+      socket = new WebSocket("ws://localhost:8080"); // Replace with your server URL
 
       socket.addEventListener("open", () => {
-        // Introduce ourselves
         socket.send(JSON.stringify({ type: "hello", name: `Player-${Math.floor(Math.random()*1000)}` }));
         resolve();
       });
 
       socket.addEventListener("message", (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          handleServerMessage(msg);
-        } catch (_) {}
+        try { handleServerMessage(JSON.parse(ev.data)); } catch (_) {}
       });
 
       socket.addEventListener("close", () => {
-        // Attempt reconnect
         if (!reconnectTimer) {
           reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
@@ -717,11 +710,7 @@ function connectSocket() {
 function handleServerMessage(msg) {
   switch (msg.type) {
     case "welcome":
-      // Sync map if server specifies
-      if (msg.map && msg.map !== currentMapName) {
-        currentMapName = msg.map;
-      }
-      // Create other players
+      if (msg.map && msg.map !== currentMapName) currentMapName = msg.map;
       otherPlayersClear();
       if (Array.isArray(msg.players)) {
         msg.players.forEach(p => {
@@ -745,7 +734,6 @@ function handleServerMessage(msg) {
         otherPlayers[msg.id].x = msg.x;
         otherPlayers[msg.id].y = msg.y;
       } else {
-        // late spawn if not tracked
         otherPlayers[msg.id] = new Player(msg.id, msg.x || 300, msg.y || 300, "cyan");
       }
       break;
@@ -755,7 +743,6 @@ function handleServerMessage(msg) {
       break;
 
     case "powerupTaken":
-      // Deactivate local powerup at these coords (approx match)
       for (const pu of powerups) {
         if (!pu.active) continue;
         if (Math.hypot(pu.x - msg.x, pu.y - msg.y) < 20) {
@@ -766,7 +753,6 @@ function handleServerMessage(msg) {
       break;
 
     case "pong":
-      // ignore
       break;
   }
 }
